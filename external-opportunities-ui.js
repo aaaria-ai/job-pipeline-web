@@ -1,23 +1,102 @@
 const esc = value => String(value ?? "").replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
 const attr = value => esc(value);
 
+export const EXTERNAL_OPPORTUNITY_PAGE_SIZE = 50;
+
+export function buildExternalSourceIndex(sources = []) {
+  const byOpportunity = new Map();
+  const bySourceId = new Map();
+  for (const source of sources || []) {
+    if (source.opportunity_id) {
+      const links = byOpportunity.get(source.opportunity_id) || [];
+      links.push(source);
+      byOpportunity.set(source.opportunity_id, links);
+    }
+    if (source.source_id) {
+      const links = bySourceId.get(source.source_id) || [];
+      links.push(source);
+      bySourceId.set(source.source_id, links);
+    }
+  }
+  return { byOpportunity, bySourceId };
+}
+
+export function sourceLinksForOpportunity(item, sourceIndex) {
+  const direct = sourceIndex?.byOpportunity?.get(item.id) || [];
+  if (direct.length || !(item.source_ids || []).length) return direct;
+  const links = [];
+  const seen = new Set();
+  for (const sourceId of item.source_ids || []) {
+    for (const source of sourceIndex.bySourceId.get(sourceId) || []) {
+      const key = `${source.source_id || ""}:${source.record_id || ""}`;
+      if (!seen.has(key)) { seen.add(key); links.push(source); }
+    }
+  }
+  return links;
+}
+
+function isUrgentOpportunity(item, now = new Date()) {
+  return item.deadline_status === "expired" || item.deadline_status === "asap"
+    || (item.deadline && new Date(item.deadline) <= new Date(now.getTime() + 7 * 86400000));
+}
+
+function matchesExternalFilter(item, filter, now = new Date()) {
+  if (filter === "all") return true;
+  if (filter === "pending") return item.review_status === "pending";
+  if (filter === "high") return item.match_status === "unique" && item.review_status === "pending";
+  if (filter === "urgent") return isUrgentOpportunity(item, now);
+  if (filter === "suspected") return item.match_status === "suspected_duplicate";
+  return item.review_status === filter;
+}
+
+export function filterExternalOpportunities(opportunities = [], { filter = "all", q = "", showInterns = false, now = new Date() } = {}) {
+  const query = String(q || "").toLowerCase();
+  return (opportunities || []).filter(item => (showInterns || item.job_type !== "intern")
+    && (!query || `${item.company} ${item.role} ${item.direction} ${item.location} ${item.jd}`.toLowerCase().includes(query))
+    && matchesExternalFilter(item, filter, now))
+    .sort((a, b) => String(a.deadline || "9999").localeCompare(String(b.deadline || "9999")) || String(a.company).localeCompare(String(b.company), "zh-CN"));
+}
+
+export function paginateExternalOpportunities(items = [], page = 1, pageSize = EXTERNAL_OPPORTUNITY_PAGE_SIZE) {
+  const size = Math.max(1, Number(pageSize) || EXTERNAL_OPPORTUNITY_PAGE_SIZE);
+  const total = items.length;
+  const pageCount = Math.max(1, Math.ceil(total / size));
+  const currentPage = Math.min(Math.max(1, Number(page) || 1), pageCount);
+  const start = (currentPage - 1) * size;
+  return { items: items.slice(start, start + size), total, page: currentPage, pageCount, start, end: Math.min(start + size, total) };
+}
+
 export function setupExternalOpportunities({ getData, fetch, reload, showError, showStatus }) {
   const root = document.querySelector("#externalOpportunityWorkspace");
   if (!root) return;
   const showInternsKey = "job-pipeline-show-external-internships";
-  const ui = { filter: "all", q: "", showInterns: localStorage.getItem(showInternsKey) === "true", selectedId: null };
+  const ui = { filter: "all", q: "", page: 1, showInterns: localStorage.getItem(showInternsKey) === "true", selectedId: null, importSummary: null };
+  let sourceIndex = buildExternalSourceIndex();
+  let indexedSources = null;
+  let searchTimer = null;
   root.innerHTML = `<input id="externalOpportunityFile" type="file" accept="application/json,.json" hidden><dialog id="externalOpportunityDialog" class="editor-dialog external-opportunity-dialog"><form id="externalOpportunityForm" method="dialog"><header><div><span class="eyebrow">HUMAN GATE</span><h2>确认进入待投递</h2></div><button type="button" class="dialog-close" data-external-close aria-label="关闭">×</button></header><p class="dialog-hint">外部岗位不会自动进入正式 Pipeline。请确认具体岗位和投递信息后再接受。</p><input id="externalOpportunityId" type="hidden"><label>公司<input id="externalCompany" required></label><label>具体岗位<input id="externalRole" required></label><div class="dialog-grid"><label>截止时间<input id="externalDeadline"></label><label>投递链接<input id="externalApplyUrl" type="url"></label></div><label>JD / 备注<textarea id="externalJd" rows="7"></textarea><footer><span></span><button type="button" data-external-close>取消</button><button class="primary" type="submit">确认并进入待投递</button></footer></form></dialog>`;
   root.insertAdjacentHTML("beforeend", `<div id="externalOpportunityContent"></div>`);
   const content = root.querySelector("#externalOpportunityContent");
   const dialog = root.querySelector("#externalOpportunityDialog");
   root.addEventListener("click", event => {
     const filter = event.target.closest("[data-external-filter]");
-    if (filter) { ui.filter = filter.dataset.externalFilter; render(); return; }
+    if (filter) { ui.filter = filter.dataset.externalFilter; ui.page = 1; render(); return; }
+    const pageButton = event.target.closest("[data-external-page]");
+    if (pageButton && !pageButton.disabled) {
+      const data = getData();
+      const filtered = viewItems(data);
+      const page = paginateExternalOpportunities(filtered, ui.page);
+      const action = pageButton.dataset.externalPage;
+      ui.page = action === "first" ? 1 : action === "prev" ? page.page - 1 : action === "next" ? page.page + 1 : page.pageCount;
+      render();
+      return;
+    }
     const mergeButton = event.target.closest("[data-external-merge-button]");
     if (mergeButton) {
       const item = getData().opportunities.find(candidate => candidate.id === mergeButton.dataset.externalId);
+      if (!item) return;
       const target = root.querySelector(`[data-external-merge-select="${CSS.escape(item.id)}"]`)?.value;
-      if (item && target) merge(item, target);
+      if (target) merge(item, target);
       return;
     }
     const action = event.target.closest("[data-external-action]");
@@ -33,26 +112,20 @@ export function setupExternalOpportunities({ getData, fetch, reload, showError, 
   root.querySelector("#externalOpportunityForm").onsubmit = submitAccept;
   root.querySelectorAll("[data-external-close]").forEach(button => button.onclick = () => dialog.close());
 
-  function viewItems() {
-    const data = getData();
-    const q = ui.q.toLowerCase();
-    return (data.opportunities || []).filter(item => (ui.showInterns || item.job_type !== "intern")
-      && (!q || `${item.company} ${item.role} ${item.direction} ${item.location} ${item.jd}`.toLowerCase().includes(q))
-      && (ui.filter === "all" || (ui.filter === "pending" && item.review_status === "pending") || (ui.filter === "high" && item.match_status === "unique" && item.review_status === "pending") || (ui.filter === "urgent" && ["asap", "expired"].includes(item.deadline_status) || ui.filter === "urgent" && item.deadline_status === "known" && new Date(item.deadline) <= new Date(Date.now() + 7 * 86400000)) || (ui.filter === "suspected" && item.match_status === "suspected_duplicate") || (ui.filter === "ignored" && item.review_status === "ignored") || (ui.filter === "accepted" && item.review_status === "accepted")))
-      .sort((a, b) => String(a.deadline || "9999").localeCompare(String(b.deadline || "9999")) || String(a.company).localeCompare(String(b.company), "zh-CN"));
+  function ensureSourceIndex(data) {
+    if (indexedSources === data.sources) return;
+    sourceIndex = buildExternalSourceIndex(data.sources || []);
+    indexedSources = data.sources;
   }
 
-  function filterCount(filter) {
-    const items = getData().opportunities || [];
+  function viewItems(data = getData()) {
+    return filterExternalOpportunities(data.opportunities || [], ui);
+  }
+
+  function filterCount(filter, data = getData()) {
+    const items = data.opportunities || [];
     if (filter === "all") return items.filter(item => ui.showInterns || item.job_type !== "intern").length;
-    return items.filter(item => {
-      if (!ui.showInterns && item.job_type === "intern") return false;
-      if (filter === "pending") return item.review_status === "pending";
-      if (filter === "high") return item.match_status === "unique" && item.review_status === "pending";
-      if (filter === "urgent") return item.deadline_status === "asap" || item.deadline_status === "expired" || (item.deadline_status === "known" && new Date(item.deadline) <= new Date(Date.now() + 7 * 86400000));
-      if (filter === "suspected") return item.match_status === "suspected_duplicate";
-      return item.review_status === filter;
-    }).length;
+    return items.filter(item => (ui.showInterns || item.job_type !== "intern") && matchesExternalFilter(item, filter)).length;
   }
 
   function deadline(item) {
@@ -64,25 +137,38 @@ export function setupExternalOpportunities({ getData, fetch, reload, showError, 
 
   function render() {
     const data = getData();
-    const items = viewItems();
+    ensureSourceIndex(data);
+    const filteredItems = viewItems(data);
+    const page = paginateExternalOpportunities(filteredItems, ui.page);
+    ui.page = page.page;
+    const items = page.items;
     const filters = [["all", "全部"], ["pending", "待确认"], ["high", "高匹配"], ["urgent", "临期"], ["suspected", "疑似重复"], ["ignored", "已忽略"], ["accepted", "已接受"]];
+    const suspectedItems = data.opportunities.filter(item => item.match_status === "suspected_duplicate");
     const cards = items.map(item => {
-      const urgent = item.deadline_status === "expired" || item.deadline_status === "asap" || (item.deadline && new Date(item.deadline) <= new Date(Date.now() + 7 * 86400000));
-      const sourceLinks = (data.sources || []).filter(source => source.opportunity_id === item.id || (item.source_ids || []).includes(source.source_id));
+      const urgent = isUrgentOpportunity(item);
+      const sourceLinks = sourceLinksForOpportunity(item, sourceIndex);
       const sourceNames = sourceLinks.map(source => source.source_name).filter(Boolean);
       const missingSources = sourceLinks.filter(source => source.status === "source_missing").map(source => source.source_name).filter(Boolean);
       const sourceText = sourceNames.length ? sourceNames.join("、") : `${item.source_count || 1} 个来源`;
       const sourceStatus = missingSources.length ? `<em class="external-source-missing">来源已消失 · ${esc(missingSources.join("、"))}</em>` : "";
       const actions = item.review_status === "pending" ? `<button data-external-action="accept" data-external-id="${attr(item.id)}" class="primary">确认进入待投递</button><button data-external-action="ignore" data-external-id="${attr(item.id)}">忽略</button>` : "";
       const suspectAction = item.match_status !== "suspected_duplicate" && item.review_status === "pending" ? `<button data-external-action="suspect" data-external-id="${attr(item.id)}">标记疑似重复</button>` : "";
-      const mergeTargets = item.match_status === "suspected_duplicate" ? data.opportunities.filter(other => other.id !== item.id && other.match_status === "suspected_duplicate").map(other => `<option value="${attr(other.id)}">${esc(other.company)} · ${esc(other.role)}</option>`).join("") : "";
+      const mergeTargets = item.match_status === "suspected_duplicate" ? suspectedItems.filter(other => other.id !== item.id).map(other => `<option value="${attr(other.id)}">${esc(other.company)} · ${esc(other.role)}</option>`).join("") : "";
       const mergeAction = mergeTargets ? `<select data-external-merge-select="${attr(item.id)}"><option value="">合并到…</option>${mergeTargets}</select><button data-external-merge-button data-external-id="${attr(item.id)}">合并来源</button>` : "";
       return `<article class="external-opportunity-card ${urgent ? "is-urgent" : ""}"><header><div><span class="eyebrow">${esc(item.job_type === "intern" ? "实习" : item.batch || "外部机会")}</span><h3>${esc(item.company || "未知公司")}</h3><p>${esc(item.role || item.role_raw || "未知岗位")}</p></div><span class="badge">${esc(item.review_status || "pending")}</span></header><div class="external-opportunity-fields"><span><small>地点</small><b>${esc(item.location || "未知")}</b></span><span><small>截止</small><b class="${urgent ? "deadline-urgent" : ""}">${esc(deadline(item))}</b></span><span><small>来源</small><b>${esc(sourceText)}</b>${sourceStatus}</span><span><small>更新时间</small><b>${esc(item.source_updated_at || "未知")}</b></span></div><p class="external-reason">${esc(item.match_reason || "待标准化")}</p><details><summary>查看 JD / 链接</summary><p>${esc(item.jd || item.requirements || "暂无 JD")}</p><div class="external-links">${item.official_url ? `<a href="${attr(item.official_url)}" target="_blank" rel="noreferrer">投递链接</a>` : ""}${item.announcement_url ? `<a href="${attr(item.announcement_url)}" target="_blank" rel="noreferrer">公告链接</a>` : ""}</div></details><footer>${actions}${suspectAction}${mergeAction}</footer></article>`;
     }).join("");
-    content.innerHTML = `<div class="external-opportunities-head"><div><span class="eyebrow">READ-ONLY FEED</span><h2>外部岗位机会</h2><p>飞书只读同步 → 外部机会池 → 标准化 / 去重 → 待确认。接受后才进入待投递。</p></div><div class="external-opportunities-actions"><label class="sensitive-toggle"><input id="showExternalInterns" type="checkbox" ${ui.showInterns ? "checked" : ""}>显示实习</label><button id="importExternalBundle" class="primary" type="button">导入飞书同步包</button></div></div><div class="external-sync-note">同步命令：<code>node scripts/sync-feishu.mjs --output feishu-sync.json</code>　·　本页只读取本地 JSON，不接触 Token。</div><div class="external-opportunity-filters">${filters.map(([key, label]) => `<button data-external-filter="${key}" class="${ui.filter === key ? "active" : ""}">${label}<span>${filterCount(key)}</span></button>`).join("")}<label class="search-field"><span aria-hidden="true">⌕</span><input id="externalOpportunitySearch" type="search" placeholder="搜索公司、岗位、地点或 JD" value="${attr(ui.q)}"></label></div><div class="external-opportunity-grid">${cards || `<div class="empty"><strong>当前筛选没有外部机会</strong><p>请先运行本地只读同步脚本并导入 JSON。</p></div>`}</div>`;
-    root.querySelector("#showExternalInterns").onchange = event => { ui.showInterns = event.target.checked; localStorage.setItem(showInternsKey, String(ui.showInterns)); render(); };
+    const first = page.total ? page.start + 1 : 0;
+    const summary = `共 ${data.opportunities.length} 条机会 · 当前筛选 ${page.total} 条 · 显示 ${first}-${page.end}`;
+    const importSummary = ui.importSummary ? `最近导入：新增 ${ui.importSummary.added || 0} · 变更 ${ui.importSummary.changed || 0} · 疑似重复 ${ui.importSummary.suspected || 0}` : "";
+    const pagination = `<div class="external-opportunity-pagination" aria-label="外部岗位分页"><span>${esc(summary)}</span><span>${page.page} / ${page.pageCount} 页</span><button data-external-page="first" ${page.page <= 1 ? "disabled" : ""}>首页</button><button data-external-page="prev" ${page.page <= 1 ? "disabled" : ""}>上一页</button><button data-external-page="next" ${page.page >= page.pageCount ? "disabled" : ""}>下一页</button><button data-external-page="last" ${page.page >= page.pageCount ? "disabled" : ""}>末页</button></div>`;
+    content.innerHTML = `<div class="external-opportunities-head"><div><span class="eyebrow">READ-ONLY FEED</span><h2>外部岗位机会</h2><p>飞书只读同步 → 外部机会池 → 标准化 / 去重 → 待确认。接受后才进入待投递。</p></div><div class="external-opportunities-actions"><label class="sensitive-toggle"><input id="showExternalInterns" type="checkbox" ${ui.showInterns ? "checked" : ""}>显示实习</label><button id="importExternalBundle" class="primary" type="button">导入飞书同步包</button></div></div><div class="external-sync-note">同步命令：<code>node scripts/sync-feishu.mjs --output feishu-sync.json</code>　·　本页只读取本地 JSON，不接触 Token。${importSummary ? `　·　${esc(importSummary)}` : ""}</div><div class="external-opportunity-filters">${filters.map(([key, label]) => `<button data-external-filter="${key}" class="${ui.filter === key ? "active" : ""}">${label}<span>${filterCount(key, data)}</span></button>`).join("")}<label class="search-field"><span aria-hidden="true">⌕</span><input id="externalOpportunitySearch" type="search" placeholder="搜索公司、岗位、地点或 JD" value="${attr(ui.q)}"></label></div>${pagination}<div class="external-opportunity-grid">${cards || `<div class="empty"><strong>当前筛选没有外部机会</strong><p>请先运行本地只读同步脚本并导入 JSON。</p></div>`}</div>${pagination}`;
+    root.querySelector("#showExternalInterns").onchange = event => { ui.showInterns = event.target.checked; ui.page = 1; localStorage.setItem(showInternsKey, String(ui.showInterns)); render(); };
     root.querySelector("#importExternalBundle").onclick = () => root.querySelector("#externalOpportunityFile").click();
-    root.querySelector("#externalOpportunitySearch").oninput = event => { ui.q = event.target.value; render(); };
+    root.querySelector("#externalOpportunitySearch").oninput = event => {
+      ui.q = event.target.value; ui.page = 1;
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(render, 250);
+    };
   }
 
   function openAccept(item) {
@@ -120,9 +206,11 @@ export function setupExternalOpportunities({ getData, fetch, reload, showError, 
     if (!file) return;
     try {
       const bundle = JSON.parse(await file.text());
-      const response = await fetch("/api/external-opportunities/import", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(bundle) });
+      // browserApiFetch accepts the parsed object directly, avoiding a second
+      // 100 MB JSON string while the local IndexedDB import is prepared.
+      const response = await fetch("/api/external-opportunities/import", { method: "POST", headers: { "Content-Type": "application/json" }, body: bundle });
       if (!response.ok) throw new Error((await response.json()).error || "同步包导入失败");
-      const stats = await response.json(); await reload(); showStatus(`飞书同步包已导入：新增 ${stats.added || 0} 条，变更 ${stats.changed || 0} 条，疑似重复 ${stats.suspected || 0} 条。`);
+      const stats = await response.json(); ui.importSummary = stats; ui.page = 1; await reload(); showStatus(`飞书同步包已导入：新增 ${stats.added || 0} 条，变更 ${stats.changed || 0} 条，疑似重复 ${stats.suspected || 0} 条。`);
     } catch (error) { showError(error); }
   }
 
